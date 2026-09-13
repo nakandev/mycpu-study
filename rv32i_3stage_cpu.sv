@@ -1,6 +1,7 @@
 module rv32i_3stage_cpu (
     input  logic        clk,
     input  logic        rst_n,
+    input  logic        stall,      // AHBウェイト用ストール信号
 
     // 命令メモリ インターフェース
     output logic [31:0] imem_addr,
@@ -18,7 +19,6 @@ module rv32i_3stage_cpu (
     // 1. IF Stage (Instruction Fetch)
     // =========================================================================
     logic [31:0] pc, pc_next;
-    logic [31:0] if_pc;
     logic        flush_if_ex;
 
     // 分岐/ジャンプ信号 (EXステージからフィードバック)
@@ -33,16 +33,17 @@ module rv32i_3stage_cpu (
         end
     end
 
+    // stall 時は PC の更新をブロック
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             pc <= 32'h0000_0000;
-        end else begin
+        end else if (!stall) begin
             pc <= pc_next;
         end
     end
 
     assign imem_addr   = pc;
-    assign flush_if_ex = ex_take_branch; // 分岐成立時はパイプラインバブルを挿入
+    assign flush_if_ex = ex_take_branch;
 
     // IF/EX パイプラインレジスタ
     typedef struct packed {
@@ -52,20 +53,25 @@ module rv32i_3stage_cpu (
 
     if_ex_reg_t if_ex;
 
+    // stall 時は IF/EX レジスタの値を保持
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n || flush_if_ex) begin
+        if (!rst_n) begin
             if_ex.pc   <= 32'h0000_0000;
             if_ex.inst <= 32'h0000_0013; // NOP (addi x0, x0, 0)
-        end else begin
-            if_ex.pc   <= pc;
-            if_ex.inst <= imem_rdata;
+        end else if (!stall) begin
+            if (flush_if_ex) begin
+                if_ex.pc   <= 32'h0000_0000;
+                if_ex.inst <= 32'h0000_0013; // NOP
+            end else begin
+                if_ex.pc   <= pc;
+                if_ex.inst <= imem_rdata;
+            end
         end
     end
 
     // =========================================================================
     // 2. EX Stage (Decode / Execute)
     // =========================================================================
-    // フィールド抽出
     logic [6:0]  opcode;
     logic [2:0]  funct3;
     logic [6:0]  funct7;
@@ -90,13 +96,12 @@ module rv32i_3stage_cpu (
     logic [31:0] rf [31:0];
     logic [31:0] rf_rs1_data, rf_rs2_data;
 
-    // レジスタ読み出し
     assign rf_rs1_data = (rs1_addr == 5'd0) ? 32'd0 : rf[rs1_addr];
     assign rf_rs2_data = (rs2_addr == 5'd0) ? 32'd0 : rf[rs2_addr];
 
-    // フォワーディング (EX/WBパイプラインハザード対策)
+    // フォワーディング
     logic [31:0] ex_rs1_data, ex_rs2_data;
-    logic [31:0] wb_final_data; // WBステージからのバイパスデータ
+    logic [31:0] wb_final_data;
     logic        ex_wb_reg_write;
     logic [4:0]  ex_wb_rd_addr;
 
@@ -112,7 +117,7 @@ module rv32i_3stage_cpu (
             ex_rs2_data = rf_rs2_data;
     end
 
-    // ALU Logic
+    // ALU
     logic [31:0] alu_operand_a, alu_operand_b;
     logic [31:0] alu_result;
 
@@ -135,11 +140,11 @@ module rv32i_3stage_cpu (
     always_comb begin
         case (opcode)
             7'b0110111, 7'b0010111: alu_result = alu_operand_a + alu_operand_b; // LUI, AUIPC
-            7'b0010011, 7'b0110011: begin // OP-IMM, OP
+            7'b0010011, 7'b0110011: begin
                 case (funct3)
                     3'b000: alu_result = (opcode == 7'b0110011 && funct7[5]) ? (alu_operand_a - alu_operand_b) : (alu_operand_a + alu_operand_b);
                     3'b001: alu_result = alu_operand_a << alu_operand_b[4:0];
-                    3 meb010: alu_result = ($signed(alu_operand_a) < $signed(alu_operand_b)) ? 32'd1 : 32'd0;
+                    3'b010: alu_result = ($signed(alu_operand_a) < $signed(alu_operand_b)) ? 32'd1 : 32'd0;
                     3'b011: alu_result = (alu_operand_a < alu_operand_b) ? 32'd1 : 32'd0;
                     3'b100: alu_result = alu_operand_a ^ alu_operand_b;
                     3'b101: alu_result = funct7[5] ? ($signed(alu_operand_a) >>> alu_operand_b[4:0]) : (alu_operand_a >> alu_operand_b[4:0]);
@@ -152,20 +157,20 @@ module rv32i_3stage_cpu (
         endcase
     end
 
-    // 分岐・ジャンプ制御 logic
+    // 分岐制御
     always_comb begin
         ex_take_branch = 1'b0;
         ex_target_pc   = 32'd0;
         case (opcode)
-            7'b1101111: begin // JAL
+            7'b1101111: begin
                 ex_take_branch = 1'b1;
                 ex_target_pc   = if_ex.pc + imm_j;
             end
-            7'b1100111: begin // JALR
+            7'b1100111: begin
                 ex_take_branch = 1'b1;
                 ex_target_pc   = (ex_rs1_data + imm_i) & ~32'd1;
             end
-            7'b1100011: begin // Branch
+            7'b1100011: begin
                 ex_target_pc = if_ex.pc + imm_b;
                 case (funct3)
                     3'b000: ex_take_branch = (ex_rs1_data == ex_rs2_data);                  // BEQ
@@ -184,17 +189,17 @@ module rv32i_3stage_cpu (
         endcase
     end
 
-    // データメモリ制御線 (EXステージ出力)
+    // データメモリインターフェース
     assign dmem_addr  = alu_result;
     assign dmem_wdata = ex_rs2_data;
-    assign dmem_we    = (opcode == 7'b0100011); // STORE命令時のみ高値
+    assign dmem_we    = (opcode == 7'b0100011);
 
     always_comb begin
         if (opcode == 7'b0100011) begin
             case (funct3[1:0])
                 2'b00: dmem_be = 4'b0001 << alu_result[1:0]; // SB
                 2'b01: dmem_be = 4'b0011 << alu_result[1:0]; // SH
-                2'b10: dmem_be = 4 meb1111;                   // SW
+                2'b10: dmem_be = 4'b1111;                    // SW
                 default: dmem_be = 4'b0000;
             endcase
         end else begin
@@ -220,6 +225,7 @@ module rv32i_3stage_cpu (
                                  (opcode == 7'b0010111) || (opcode == 7'b1101111) ||
                                  (opcode == 7'b1100111);
 
+    // stall 時は EX/WB レジスタの更新を抑制
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             ex_wb.pc         <= 32'd0;
@@ -228,7 +234,7 @@ module rv32i_3stage_cpu (
             ex_wb.opcode     <= 7'd0;
             ex_wb.funct3     <= 3'd0;
             ex_wb.reg_write  <= 1'b0;
-        end else begin
+        end else if (!stall) begin
             ex_wb.pc         <= if_ex.pc;
             ex_wb.alu_result <= alu_result;
             ex_wb.rd_addr    <= rd_addr;
@@ -238,7 +244,6 @@ module rv32i_3stage_cpu (
         end
     end
 
-    // Forwarding参照用
     assign ex_wb_reg_write = ex_wb.reg_write;
     assign ex_wb_rd_addr   = ex_wb.rd_addr;
 
@@ -247,7 +252,6 @@ module rv32i_3stage_cpu (
     // =========================================================================
     logic [31:0] load_data;
 
-    // メモリからのロードデータ処理 (符号拡張含む)
     always_comb begin
         case (ex_wb.funct3)
             3'b000: begin // LB
@@ -283,20 +287,19 @@ module rv32i_3stage_cpu (
         endcase
     end
 
-    // レジスタ書き戻しデータの選択
     always_comb begin
         if (ex_wb.opcode == 7'b0000011) begin
             wb_final_data = load_data;               // LOAD
-        end else if (ex_wb.opcode == 7'b1101111 || ex_wb.opcode == 7 meb1100111) begin
+        end else if (ex_wb.opcode == 7'b1101111 || ex_wb.opcode == 7'b1100111) begin
             wb_final_data = ex_wb.pc + 32'd4;        // JAL / JALR (戻りアドレス)
         end else begin
             wb_final_data = ex_wb.alu_result;        // ALU演算 / LUI / AUIPC
         end
     end
 
-    // レジスタ書き込み実行
+    // stall 時はレジスタ書き込みも抑制
     always_ff @(posedge clk) begin
-        if (ex_wb.reg_write && (ex_wb.rd_addr != 5'd0)) begin
+        if (!stall && ex_wb.reg_write && (ex_wb.rd_addr != 5'd0)) begin
             rf[ex_wb.rd_addr] <= wb_final_data;
         end
     end

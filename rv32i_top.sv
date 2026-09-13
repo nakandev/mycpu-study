@@ -7,16 +7,17 @@ module rv32i_top (
     ahb_if.master ahb_d
 );
 
-    // CPU - Bridge 間の内部接続ワイヤ
     logic [31:0] imem_addr, imem_rdata;
     logic [31:0] dmem_addr, dmem_wdata, dmem_rdata;
     logic        dmem_we;
     logic [3:0]  dmem_be;
+    logic        stall;
 
-    // CPUコア インスタンス
+    // CPUコア
     rv32i_3stage_cpu u_cpu (
         .clk        (clk),
         .rst_n      (rst_n),
+        .stall      (stall),
         .imem_addr  (imem_addr),
         .imem_rdata (imem_rdata),
         .dmem_addr  (dmem_addr),
@@ -26,7 +27,7 @@ module rv32i_top (
         .dmem_be    (dmem_be)
     );
 
-    // AHB Bridge インスタンス
+    // AHB Bridge
     rv32i_ahb_bridge u_ahb_bridge (
         .cpu_imem_addr  (imem_addr),
         .cpu_imem_rdata (imem_rdata),
@@ -35,7 +36,7 @@ module rv32i_top (
         .cpu_dmem_rdata (dmem_rdata),
         .cpu_dmem_we    (dmem_we),
         .cpu_dmem_be    (dmem_be),
-        // AHB インターフェースの接続
+        .stall          (stall),
         .ahb_i          (ahb_i),
         .ahb_d          (ahb_d)
     );
