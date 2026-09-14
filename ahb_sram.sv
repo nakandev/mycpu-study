@@ -5,6 +5,11 @@ module ahb_sram #(
     ahb_if.slave ahb
 );
 
+    initial begin
+        // ファイルが存在すればロード（初期設定）
+        $readmemh("prog.hex", mem);
+    end
+
     // メモリアレイ (32-bit x MEM_SIZE)
     logic [31:0] mem [0:MEM_SIZE-1];
 
@@ -50,7 +55,7 @@ module ahb_sram #(
                 // ウェイト処理中
                 if (wait_cnt > 1) begin
                     wait_cnt   <= wait_cnt - 1;
-                    ahb.hready <= 1 meb0;
+                    ahb.hready <= 1'b0;
                 end else begin
                     wait_cnt   <= 0;
                     ahb.hready <= 1'b1; // アクセス完了
