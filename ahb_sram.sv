@@ -1,7 +1,10 @@
+`timescale 1ns/1ps
+
 module ahb_sram #(
-    parameter int MEM_SIZE = 1024, // ワード数 (4KB)
-    parameter int WAIT_CYCLES = 0  // 固定ウェイト数 (0ならウェイトなし)
-)(
+    parameter int MEM_SIZE    = 16384, // メモリサイズ (32-bit ワード数 / デフォルト 16K words = 64KB)
+    parameter int WAIT_CYCLES = 0      // 挿入するウェイトサイクル数 (0でノーウェイト)
+) (
+    // AHB Slave インターフェース
     ahb_if.slave ahb
 );
 
@@ -10,72 +13,97 @@ module ahb_sram #(
         $readmemh("prog.hex", mem);
     end
 
-    // メモリアレイ (32-bit x MEM_SIZE)
+    // メモリ本体 (32-bit ワード構成)
     logic [31:0] mem [0:MEM_SIZE-1];
 
-    // パイプライン制御用内部信号
+    // -------------------------------------------------------------------------
+    // 1. パイプライン制御用レジスタ（アドレスフェーズ -> データフェーズ伝達）
+    // -------------------------------------------------------------------------
     logic [31:0] addr_reg;
     logic        write_reg;
-    logic [1:0]  trans_reg;
-    logic        sel_reg;
+    logic        active_reg;
 
     // ウェイト制御用カウンタ
-    int wait_cnt;
+    int unsigned wait_cnt;
 
-    // アドレスフェーズのラッチ
+    // バス上の有効な転送要求の判定 (hsel かつ HTRANS が NONSEQ(2'b10) または SEQ(2'b11))
+    logic valid_req;
+    assign valid_req = ahb.hsel && ahb.htrans[1];
+
+    // -------------------------------------------------------------------------
+    // 2. アドレスフェーズ信号のラッチ & ウェイト制御
+    // -------------------------------------------------------------------------
     always_ff @(posedge ahb.HCLK or negedge ahb.HRESETn) begin
         if (!ahb.HRESETn) begin
-            addr_reg  <= 32'd0;
-            write_reg <= 1'b0;
-            trans_reg <= 2'b00;
-            sel_reg   <= 1'b0;
-        end else if (ahb.hready) begin
-            addr_reg  <= ahb.haddr;
-            write_reg <= ahb.hwrite;
-            trans_reg <= ahb.htrans;
-            sel_reg   <= ahb.hsel;
-        end
-    end
-
-    // ウェイト（hready）制御
-    always_ff @(posedge ahb.HCLK or negedge ahb.HRESETn) begin
-        if (!ahb.HRESETn) begin
-            wait_cnt   <= 0;
-            ahb.hready <= 1'b1;
+            addr_reg   <= 32'd0;
+            write_reg  <= 1'b0;
+            active_reg <= 1'b0;
+            wait_cnt   <= '0;
         end else begin
             if (ahb.hready) begin
-                // トランザクション発生時にウェイトを開始
-                if (ahb.hsel && (ahb.htrans[1] == 1'b1) && (WAIT_CYCLES > 0)) begin
+                // 前回の転送が完了(hready=1)したタイミングで次のアクセス要求を取り込む
+                if (valid_req) begin
+                    addr_reg   <= ahb.haddr;
+                    write_reg  <= ahb.hwrite;
+                    active_reg <= 1'b1;
                     wait_cnt   <= WAIT_CYCLES;
-                    ahb.hready <= 1'b0;
                 end else begin
-                    ahb.hready <= 1'b1;
+                    active_reg <= 1'b0;
+                    wait_cnt   <= '0;
                 end
             end else begin
-                // ウェイト処理中
-                if (wait_cnt > 1) begin
-                    wait_cnt   <= wait_cnt - 1;
-                    ahb.hready <= 1'b0;
-                end else begin
-                    wait_cnt   <= 0;
-                    ahb.hready <= 1'b1; // アクセス完了
+                // ウェイト実行中: カウントダウン
+                if (wait_cnt > 0) begin
+                    wait_cnt <= wait_cnt - 1;
                 end
             end
         end
     end
 
-    // データ書き込み（データフェーズ）
-    logic [31:0] word_addr;
-    assign word_addr = addr_reg[31:2];
+    // -------------------------------------------------------------------------
+    // 3. 応答信号 (hready, hresp) の出力制御
+    // -------------------------------------------------------------------------
+    // データフェーズ中かつウェイトカウンタ残存時は hready = 0
+    assign ahb.hready = (WAIT_CYCLES == 0) ? 1'b1 : !(active_reg && (wait_cnt > 0));
+    assign ahb.hresp  = 1'b0; // 常時 OKAY 応答
 
+    // -------------------------------------------------------------------------
+    // 4. データフェーズの処理（書き込み & 読み出し）
+    // -------------------------------------------------------------------------
+    logic [31:0] word_addr;
+    assign word_addr = addr_reg[31:2]; // Word-aligned address
+
+    // 【書き込み処理】
+    // active_reg & write_reg がアサートされているデータフェーズのクロック立ち上がりで、
+    // ブリッジから1サイクル遅れで正しく出力されている ahb.hwdata をメモリに書き込む
     always_ff @(posedge ahb.HCLK) begin
-        if (ahb.hready && sel_reg && write_reg && (trans_reg[1] == 1'b1)) begin
-            mem[word_addr] <= ahb.hwdata;
+        if (active_reg && write_reg && ahb.hready) begin
+            if (word_addr < MEM_SIZE) begin
+                mem[word_addr] <= ahb.hwdata;
+            end
         end
     end
 
-    // データ読み出し（データフェーズ）
-    assign ahb.hrdata = (sel_reg && !write_reg) ? mem[word_addr] : 32'd0;
-    assign ahb.hresp  = 1'b0; // OKAY応答
+    // 【読み出し処理】
+    // データフェーズ中、かつ hready == 1 の完了タイミングでデータを確定してバスへ出力
+    // assign ahb.hrdata = (active_reg && !write_reg && ahb.hready && (word_addr < MEM_SIZE))
+    //                     ? mem[word_addr]
+    //                     : 32'd0;
+    // 
+    // 【読み出し処理】 active_reg (データフェーズ) の間、ラッチ済みアドレス mem[addr_reg] を組合せ回路で直接出力
+    //  (A) シミュレーション向け
+    assign ahb.hrdata = (active_reg && !write_reg && (word_addr < MEM_SIZE))
+                        ? mem[word_addr]
+                        : 32'd0;
+
+    // //   (B) FPGA BRAM向け
+    // logic [31:0] rdata_reg;
+    // // クロック同期でメモリから読み出し (BRAM 推論パターン)
+    // always_ff @(posedge ahb.HCLK) begin
+    //     if (ahb.hready && valid_req && !ahb.hwrite) begin
+    //         rdata_reg <= mem[ahb.haddr[31:2]]; // アドレスフェーズで読み出し開始
+    //     end
+    // end
+    // assign ahb.hrdata = rdata_reg;
 
 endmodule

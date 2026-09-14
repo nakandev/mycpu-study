@@ -31,20 +31,20 @@ module tb_rv32i_top (
     // データ用 SRAM (ウェイト2サイクル)
     ahb_sram #(
         .MEM_SIZE(1024),
-        .WAIT_CYCLES(2)
+        .WAIT_CYCLES(5)
     ) u_dmem (
         .ahb (ahb_d_if.slave)
     );
 
     // テストプログラムのロード
-    initial begin
-        u_imem.mem[0] = 32'h00500093; // addi x1, x0, 5
-        u_imem.mem[1] = 32'h00a00113; // addi x2, x0, 10
-        u_imem.mem[2] = 32'h002081b3; // add  x3, x1, x2
-        u_imem.mem[3] = 32'h00302023; // sw   x3, 0(x0)
-        u_imem.mem[4] = 32'h00002203; // lw   x4, 0(x0)
-        u_imem.mem[5] = 32'h0000006f; // jal  x0, 0
-    end
+    // initial begin
+    //     u_imem.mem[0] = 32'h00500093; // addi x1, x0, 5
+    //     u_imem.mem[1] = 32'h00a00113; // addi x2, x0, 10
+    //     u_imem.mem[2] = 32'h002081b3; // add  x3, x1, x2
+    //     u_imem.mem[3] = 32'h00302023; // sw   x3, 0(x0)
+    //     u_imem.mem[4] = 32'h00002203; // lw   x4, 0(x0)
+    //     u_imem.mem[5] = 32'h0000006f; // jal  x0, 0
+    // end
 
     // 結果判定モジュール
     always_ff @(posedge clk) begin

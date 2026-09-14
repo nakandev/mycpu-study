@@ -1,66 +1,65 @@
+`timescale 1ns/1ps
+
 module rv32i_ahb_bridge (
-    // CPU Interface
-    input  logic [31:0] cpu_imem_addr,
-    output logic [31:0] cpu_imem_rdata,
+    input  logic        clk,
+    input  logic        rst_n,
 
-    input  logic [31:0] cpu_dmem_addr,
-    input  logic [31:0] cpu_dmem_wdata,
-    output logic [31:0] cpu_dmem_rdata,
-    input  logic        cpu_dmem_we,
-    input  logic [3:0]  cpu_dmem_be,
+    // CPU側 インターフェース
+    input  logic [31:0] cpu_haddr,
+    input  logic [31:0] cpu_hwdata,
+    input  logic        cpu_hwrite,
+    input  logic        cpu_req,
+    output logic [31:0] cpu_hrdata,
+    output logic        cpu_hready,
 
-    output logic        stall, // CPUへ出力するストール信号
-
-    // AHB Master Interfaces
-    ahb_if.master       ahb_i,
-    ahb_if.master       ahb_d
+    // AHB Master インターフェース (ahb_if)
+    ahb_if.master       ahb
 );
 
-    localparam HTRANS_IDLE   = 2'b00;
-    localparam HTRANS_NONSEQ = 2'b10;
-
-    // 命令バス側またはデータバス側のいずれかがウェイト中であれば CPU をストール
-    assign stall = (!ahb_i.hready) || (dmem_req && !ahb_d.hready);
-
-    // Instruction Bus
-    assign ahb_i.haddr  = cpu_imem_addr;
-    assign ahb_i.htrans = HTRANS_NONSEQ;
-    assign ahb_i.hwrite = 1'b0;
-    assign ahb_i.hwdata = 32'd0;
-
-    assign cpu_imem_rdata = ahb_i.hrdata;
-
-    // Data Bus
-    logic dmem_req;
-    assign dmem_req = cpu_dmem_we || (cpu_dmem_be != 4'b0000);
-
-    assign ahb_d.haddr  = cpu_dmem_addr;
-    assign ahb_d.htrans = dmem_req ? HTRANS_NONSEQ : HTRANS_IDLE;
-    assign ahb_d.hwrite = cpu_dmem_we;
-
-    logic [31:0] aligned_wdata;
-    always_comb begin
-        case (cpu_dmem_be)
-            4'b0001: aligned_wdata = {4{cpu_dmem_wdata[7:0]}};
-            4'b0010: aligned_wdata = {2{cpu_dmem_wdata[7:0], 8'd0}};
-            4'b0100: aligned_wdata = {2{8'd0, cpu_dmem_wdata[7:0]}};
-            4'b1000: aligned_wdata = {cpu_dmem_wdata[7:0], 24'd0};
-            4'b0011: aligned_wdata = {2{cpu_dmem_wdata[15:0]}};
-            4'b1100: aligned_wdata = {cpu_dmem_wdata[15:0], 16'd0};
-            default: aligned_wdata = cpu_dmem_wdata;
-        endcase
-    end
-
+    // データフェーズ追跡用フラグ
+    logic data_phase;
+    logic is_write_phase;
     logic [31:0] hwdata_reg;
-    always_ff @(posedge ahb_d.HCLK or negedge ahb_d.HRESETn) begin
-        if (!ahb_d.HRESETn) begin
-            hwdata_reg <= 32'd0;
-        end else if (ahb_d.hready) begin
-            hwdata_reg <= aligned_wdata;
+
+    // -------------------------------------------------------------------------
+    // 1. フェーズ管理 & データパイプライン
+    // -------------------------------------------------------------------------
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            data_phase     <= 1'b0;
+            is_write_phase <= 1'b0;
+            hwdata_reg     <= 32'd0;
+        end else begin
+            if (ahb.hready) begin
+                if (cpu_req && !data_phase) begin
+                    // アドレスフェーズ開始 -> 次サイクルはデータフェーズ
+                    data_phase     <= 1'b1;
+                    is_write_phase <= cpu_hwrite;
+                    hwdata_reg     <= cpu_hwdata;
+                end else begin
+                    // データフェーズ完了
+                    data_phase     <= 1'b0;
+                    is_write_phase <= 1'b0;
+                end
+            end
         end
     end
 
-    assign ahb_d.hwdata   = hwdata_reg;
-    assign cpu_dmem_rdata = ahb_d.hrdata;
+    // -------------------------------------------------------------------------
+    // 2. AHB バス出力制御
+    // -------------------------------------------------------------------------
+    // アドレスフェーズのサイクルでのみ NONSEQ を出力
+    assign ahb.htrans = (cpu_req && !data_phase) ? 2'b10 : 2'b00;
+    assign ahb.haddr  = cpu_haddr;
+    assign ahb.hwrite = cpu_hwrite;
+    assign ahb.hwdata = hwdata_reg;
+
+    // -------------------------------------------------------------------------
+    // 3. CPU側 応答制御 (ストール制御)
+    // -------------------------------------------------------------------------
+    // 読み出しの場合、データフェーズ(data_phase == 1)で ahb.hready が立つまで CPU をウェイトさせる
+    // 書き込みの場合も、データフェーズ完了まで引き伸ばす
+    assign cpu_hready = data_phase && ahb.hready;
+    assign cpu_hrdata = ahb.hrdata;
 
 endmodule
