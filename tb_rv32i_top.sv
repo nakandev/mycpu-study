@@ -36,9 +36,8 @@ module tb_rv32i_top (
         .ahb (ahb_d_if.slave)
     );
 
-    // テストプログラムのロードとパス/フェイル判定
+    // テストプログラムのロード
     initial begin
-        // テストプログラムの書き込み
         u_imem.mem[0] = 32'h00500093; // addi x1, x0, 5
         u_imem.mem[1] = 32'h00a00113; // addi x2, x0, 10
         u_imem.mem[2] = 32'h002081b3; // add  x3, x1, x2
@@ -47,15 +46,16 @@ module tb_rv32i_top (
         u_imem.mem[5] = 32'h0000006f; // jal  x0, 0
     end
 
-    // 期待する結果を監視（結果判定）
-    always @(posedge clk) begin
+    // 結果判定モジュール
+    always_ff @(posedge clk) begin
         if (rst_n) begin
+            // 目的のデータが書き込まれたら表示して終了
             if (u_dmem.mem[0] == 32'd15 && u_top.u_cpu.rf[4] == 32'd15) begin
                 $display("\n===========================================");
                 $display("[SUCCESS] Memory Write & Readback Verified!");
                 $display("  Mem[0] = %d, Reg x4 = %d", u_dmem.mem[0], u_top.u_cpu.rf[4]);
                 $display("===========================================\n");
-                $finish; // Verilato側にシミュレーション終了を通知
+                $finish;
             end
         end
     end

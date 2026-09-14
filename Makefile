@@ -1,5 +1,6 @@
 VERILATOR = verilator
 VERILATOR_FLAGS = -Wall -Wno-fatal -Wno-lint --trace --cc --exe
+# VERILATOR_FLAGS = -Wall -Wno-fatal -Wno-lint --trace --cc --exe --public-flat-rw
 
 # ソースファイル
 SV_SRCS = ahb_if.sv \
